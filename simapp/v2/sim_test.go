@@ -124,7 +124,7 @@ func SetupTestInstance[T Tx](t *testing.T) TestInstance[T] {
 		BankKeeper: bankKeeper,
 		AuthKeeper: authKeeper,
 		TxDecoder:  simsxv2.NewGenericTxDecoder[T](app.TxConfig()),
-		TXBuilder:  simsxv2.NewGenericTXBuilder[T](app.TxConfig()),
+		TXBuilder:  simsxv2.NewSDKTXBuilder[T](app.TxConfig(), simsxv2.DefaultGenTxGas),
 	}
 }
 
@@ -170,7 +170,7 @@ func prepareInitialGenesisState[T Tx](
 	tCfg simtypes.Config,
 ) ([]simtypes.Account, json.RawMessage, string, time.Time) {
 	txConfig := app.TxConfig()
-	// todo: replace legacy testdata functions
+	// todo: replace legacy testdata functions ?
 	appStateFn := simtestutil.AppStateFn(
 		app.AppCodec(),
 		txConfig.SigningContext().AddressCodec(),

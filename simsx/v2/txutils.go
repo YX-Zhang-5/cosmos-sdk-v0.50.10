@@ -2,23 +2,29 @@ package v2
 
 import (
 	"context"
-	"errors"
-	"math/rand"
-
 	"cosmossdk.io/core/transaction"
-
+	"errors"
 	"github.com/cosmos/cosmos-sdk/client"
-	types2 "github.com/cosmos/cosmos-sdk/crypto/types"
+	cryptotypes "github.com/cosmos/cosmos-sdk/crypto/types"
 	"github.com/cosmos/cosmos-sdk/simsx"
-	"github.com/cosmos/cosmos-sdk/testutil/sims"
-	"github.com/cosmos/cosmos-sdk/types"
+	sdk "github.com/cosmos/cosmos-sdk/types"
+	"github.com/cosmos/cosmos-sdk/types/simulation"
+	"github.com/cosmos/cosmos-sdk/types/tx/signing"
+	authsign "github.com/cosmos/cosmos-sdk/x/auth/signing"
+	"math/rand"
 )
 
+const DefaultGenTxGas = 10_000_000
+
+type Tx = transaction.Tx
+
+// TXBuilder abstract transaction builder
 type TXBuilder[T Tx] interface {
+	// Build creates a signed transaction
 	Build(ctx context.Context,
 		ak simsx.AccountSource,
 		senders []simsx.SimAccount,
-		msg types.Msg,
+		msg sdk.Msg,
 		r *rand.Rand,
 		chainID string,
 	) (T, error)
@@ -26,15 +32,36 @@ type TXBuilder[T Tx] interface {
 
 var _ TXBuilder[Tx] = TXBuilderFn[Tx](nil)
 
-type TXBuilderFn[T Tx] func(ctx context.Context, ak simsx.AccountSource, senders []simsx.SimAccount, msg types.Msg, r *rand.Rand, chainID string) (T, error)
+// TXBuilderFn adapter that implements the TXBuilder interface
+type TXBuilderFn[T Tx] func(ctx context.Context, ak simsx.AccountSource, senders []simsx.SimAccount, msg sdk.Msg, r *rand.Rand, chainID string) (T, error)
 
-func (b TXBuilderFn[T]) Build(ctx context.Context, ak simsx.AccountSource, senders []simsx.SimAccount, msg types.Msg, r *rand.Rand, chainID string) (T, error) {
+func (b TXBuilderFn[T]) Build(ctx context.Context, ak simsx.AccountSource, senders []simsx.SimAccount, msg sdk.Msg, r *rand.Rand, chainID string) (T, error) {
 	return b(ctx, ak, senders, msg, r, chainID)
 }
 
-func NewGenericTXBuilder[T Tx](txConfig client.TxConfig) TXBuilder[T] {
-	return TXBuilderFn[T](func(ctx context.Context, ak simsx.AccountSource, senders []simsx.SimAccount, msg types.Msg, r *rand.Rand, chainID string) (tx T, err error) {
-		sdkTx, err := BuildTestTX(ctx, ak, senders, msg, r, txConfig, chainID)
+// NewSDKTXBuilder constructor to create a signed transaction builder for sdk.Tx type.
+func NewSDKTXBuilder[T Tx](txConfig client.TxConfig, defaultGas uint64) TXBuilder[T] {
+	return TXBuilderFn[T](func(ctx context.Context, ak simsx.AccountSource, senders []simsx.SimAccount, msg sdk.Msg, r *rand.Rand, chainID string) (tx T, err error) {
+		accountNumbers := make([]uint64, len(senders))
+		sequenceNumbers := make([]uint64, len(senders))
+		for i := 0; i < len(senders); i++ {
+			acc := ak.GetAccount(ctx, senders[i].Address)
+			accountNumbers[i] = acc.GetAccountNumber()
+			sequenceNumbers[i] = acc.GetSequence()
+		}
+		fees := senders[0].LiquidBalance().RandFees()
+		sdkTx, err := GenSignedMockTx(
+			r,
+			txConfig,
+			[]sdk.Msg{msg},
+			fees,
+			defaultGas,
+			chainID,
+			accountNumbers,
+			sequenceNumbers,
+			simsx.Collect(senders, func(a simsx.SimAccount) cryptotypes.PrivKey { return a.PrivKey })...,
+		)
+
 		if err != nil {
 			return tx, err
 		}
@@ -46,41 +73,85 @@ func NewGenericTXBuilder[T Tx](txConfig client.TxConfig) TXBuilder[T] {
 	})
 }
 
-func BuildTestTX(
-	ctx context.Context,
-	ak simsx.AccountSource,
-	senders []simsx.SimAccount,
-	msg types.Msg,
+// GenSignedMockTx generates a signed mock transaction.
+func GenSignedMockTx(
 	r *rand.Rand,
 	txConfig client.TxConfig,
+	msgs []sdk.Msg,
+	feeAmt sdk.Coins,
+	gas uint64,
 	chainID string,
-) (types.Tx, error) {
-	accountNumbers := make([]uint64, len(senders))
-	sequenceNumbers := make([]uint64, len(senders))
-	for i := 0; i < len(senders); i++ {
-		acc := ak.GetAccount(ctx, senders[i].Address)
-		accountNumbers[i] = acc.GetAccountNumber()
-		sequenceNumbers[i] = acc.GetSequence()
-	}
-	fees := senders[0].LiquidBalance().RandFees()
-	return sims.GenSignedMockTx( // todo: inline code from testutil
-		r,
-		txConfig,
-		[]types.Msg{msg},
-		fees,
-		sims.DefaultGenTxGas,
-		chainID,
-		accountNumbers,
-		sequenceNumbers,
-		simsx.Collect(senders, func(a simsx.SimAccount) types2.PrivKey { return a.PrivKey })...,
-	)
-}
+	accNums, accSeqs []uint64,
+	priv ...cryptotypes.PrivKey,
+) (sdk.Tx, error) {
+	sigs := make([]signing.SignatureV2, len(priv))
 
-type Tx = transaction.Tx
+	// create a random length memo
+	memo := simulation.RandStringOfLength(r, simulation.RandIntBetween(r, 0, 100))
+
+	signMode, err := authsign.APISignModeToInternal(txConfig.SignModeHandler().DefaultMode())
+	if err != nil {
+		return nil, err
+	}
+
+	// 1st round: set SignatureV2 with empty signatures, to set correct
+	// signer infos.
+	for i, p := range priv {
+		sigs[i] = signing.SignatureV2{
+			PubKey: p.PubKey(),
+			Data: &signing.SingleSignatureData{
+				SignMode: signMode,
+			},
+			Sequence: accSeqs[i],
+		}
+	}
+
+	tx := txConfig.NewTxBuilder()
+	err = tx.SetMsgs(msgs...)
+	if err != nil {
+		return nil, err
+	}
+	err = tx.SetSignatures(sigs...)
+	if err != nil {
+		return nil, err
+	}
+	tx.SetMemo(memo)
+	tx.SetFeeAmount(feeAmt)
+	tx.SetGasLimit(gas)
+
+	// 2nd round: once all signer infos are set, every signer can sign.
+	for i, p := range priv {
+		signerData := authsign.SignerData{
+			Address:       sdk.AccAddress(p.PubKey().Address()).String(),
+			ChainID:       chainID,
+			AccountNumber: accNums[i],
+			Sequence:      accSeqs[i],
+			PubKey:        p.PubKey(),
+		}
+
+		signBytes, err := authsign.GetSignBytesAdapter(
+			context.Background(), txConfig.SignModeHandler(), signMode, signerData,
+			tx.GetTx())
+		if err != nil {
+			panic(err)
+		}
+		sig, err := p.Sign(signBytes)
+		if err != nil {
+			panic(err)
+		}
+		sigs[i].Data.(*signing.SingleSignatureData).Signature = sig
+	}
+	err = tx.SetSignatures(sigs...)
+	if err != nil {
+		panic(err)
+	}
+
+	return tx.GetTx(), nil
+}
 
 var _ transaction.Codec[Tx] = &GenericTxDecoder[Tx]{}
 
-// todo: this is the same as in commands
+// GenericTxDecoder Encoder type that implements transaction.Codec
 type GenericTxDecoder[T Tx] struct {
 	txConfig client.TxConfig
 }
