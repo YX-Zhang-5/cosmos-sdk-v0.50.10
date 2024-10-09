@@ -23,6 +23,8 @@ import (
 	corecontext "cosmossdk.io/core/context"
 	"cosmossdk.io/core/server"
 	"cosmossdk.io/core/store"
+	storev2 "cosmossdk.io/store/v2"
+
 	"cosmossdk.io/core/transaction"
 	"cosmossdk.io/depinject"
 	"cosmossdk.io/log"
@@ -36,7 +38,6 @@ import (
 	"github.com/cosmos/cosmos-sdk/codec"
 	"github.com/cosmos/cosmos-sdk/simsx"
 	simsxv2 "github.com/cosmos/cosmos-sdk/simsx/v2"
-	"github.com/cosmos/cosmos-sdk/std"
 	simtestutil "github.com/cosmos/cosmos-sdk/testutil/sims"
 	"github.com/cosmos/cosmos-sdk/types/module"
 	simtypes "github.com/cosmos/cosmos-sdk/types/simulation"
@@ -74,7 +75,7 @@ type SimulationApp[T Tx] interface {
 	ModuleManager() *runtime.MM[T]
 	AppCodec() codec.Codec
 	DefaultGenesis() map[string]json.RawMessage
-	GetStore() any // todo: why is this an any type?
+	GetStore() storev2.RootStore
 }
 type TestInstance[T Tx] struct {
 	App        SimulationApp[T]
@@ -101,18 +102,7 @@ func SetupTestInstance[T Tx](t *testing.T) TestInstance[T] {
 	err = depinject.Inject(
 		depinject.Configs(
 			AppConfig(),
-			runtime.DefaultServiceBindings(),
 			depinject.Supply(log.NewNopLogger()),
-			depinject.Provide(
-				codec.ProvideInterfaceRegistry,
-				codec.ProvideAddressCodec,
-				codec.ProvideProtoCodec,
-				codec.ProvideLegacyAmino,
-			),
-			depinject.Invoke(
-				std.RegisterInterfaces,
-				std.RegisterLegacyAminoCodec,
-			),
 		),
 		&authKeeper,
 		&bankKeeper,
@@ -136,7 +126,7 @@ func TestSimsAppV2(t *testing.T) {
 	accounts, genesisAppState, chainID, genesisTimestamp := prepareInitialGenesisState(testInstance.App, r, testInstance.BankKeeper, tCfg)
 
 	appManager := testInstance.App.GetAppManager()
-	appStore := testInstance.App.GetStore().(cometbfttypes.Store)
+	appStore := testInstance.App.GetStore()
 	txConfig := testInstance.App.TxConfig()
 	rootCtx, done := context.WithCancel(context.Background())
 	defer done()
@@ -241,7 +231,7 @@ type chainState[T Tx] struct {
 	valsetHistory      *simsxv2.ValSetHistory
 	stateRoot          store.Hash
 	app                *appmanager.AppManager[T]
-	appStore           cometbfttypes.Store
+	appStore           storev2.RootStore
 	txConfig           client.TxConfig
 }
 
